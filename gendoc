@@ -1,0 +1,578 @@
+#!/usr/bin/env python3
+"""
+ODT to PDF Generator with YAML Variable Substitution
+
+Usage:
+    ./odt2pdf.py                  # Process all matching .odt + .yaml pairs
+    ./odt2pdf.py 10days           # Process 10days.odt + 10days.yaml → 10days.pdf
+    ./odt2pdf.py invoice receipt  # Process multiple base names
+"""
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import zipfile
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    print("Error: PyYAML is required. Install it with: pip install pyyaml", file=sys.stderr)
+    sys.exit(1)
+
+
+def check_dependencies() -> bool:
+    """Check if all required dependencies are available."""
+    # Check for LibreOffice
+    try:
+        result = subprocess.run(
+            ["libreoffice", "--version"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+    except FileNotFoundError:
+        print("Error: LibreOffice not found.", file=sys.stderr)
+        print("Install it with: sudo apt install libreoffice", file=sys.stderr)
+        return False
+    except subprocess.CalledProcessError:
+        print("Error: LibreOffice found but not working properly.", file=sys.stderr)
+        return False
+    
+    return True
+
+
+def escape_xml(value: str) -> str:
+    """
+    Escape special XML characters in a string.
+    Also converts newlines to ODT line breaks.
+    """
+    if not isinstance(value, str):
+        value = str(value)
+    
+    # First escape XML special characters
+    value = (
+        value
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
+    
+    # Convert newlines to ODT line breaks
+    value = value.replace("\n", "<text:line-break/>")
+    
+    return value
+
+
+def make_hyperlink(url: str, display_text: str = None) -> str:
+    """
+    Create an ODT hyperlink XML element.
+    If display_text is None, the URL itself is used as the display text.
+    """
+    if display_text is None:
+        display_text = url
+    
+    escaped_url = escape_xml(url)
+    escaped_text = escape_xml(display_text)
+    
+    return (
+        f'<text:a xlink:type="simple" xlink:href="{escaped_url}" '
+        f'text:style-name="Internet_20_link" '
+        f'text:visited-style-name="Visited_20_Internet_20_Link">'
+        f'{escaped_text}</text:a>'
+    )
+
+
+def is_url_variable(key: str) -> bool:
+    """Check if a variable key should be treated as a URL (ends with -url)."""
+    return key.lower().endswith('-url')
+
+
+def find_placeholders(content: str) -> set:
+    """
+    Find all {{variable-name}} placeholders in the content.
+    Handles placeholders that may be split by XML tags.
+    """
+    placeholders = set()
+    
+    # Find intact placeholders
+    intact_pattern = r'\{\{([^{}]+)\}\}'
+    for match in re.finditer(intact_pattern, content):
+        placeholders.add(match.group(1))
+    
+    # Find split placeholders (with XML tags inside)
+    split_pattern = r'\{\{(?:<[^>]+>)*([^{}]+?)(?:<[^>]+>)*\}\}'
+    for match in re.finditer(split_pattern, content):
+        # Remove any remaining XML tags from the key
+        key = re.sub(r'<[^>]+>', '', match.group(0))
+        key = key.strip('{}').strip()
+        if key:
+            placeholders.add(key)
+    
+    return placeholders
+
+
+def get_template_from_yaml(yaml_path: str) -> str:
+    """
+    Quick read of YAML file to extract the 'template' field if present.
+    Returns the template name (without .odt extension) or None.
+    """
+    try:
+        with open(yaml_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        if isinstance(data, dict) and 'template' in data:
+            template = data['template']
+            # Strip .odt extension if provided
+            if template.endswith('.odt'):
+                template = template[:-4]
+            return template
+    except Exception:
+        pass
+    return None
+
+
+def load_yaml_data(yaml_path: str, _loaded_files: set = None) -> dict:
+    """
+    Load and validate YAML data file.
+    Supports 'extends' to inherit from other YAML files.
+    Supports 'template' to specify which ODT file to use.
+    
+    Examples:
+        template: 10days                  # Use 10days.odt as template
+        extends: defaults.yaml            # Single file
+        extends:                          # Multiple files
+          - defaults.yaml
+          - seller-info.yaml
+    
+    Values in the current file override values from extended files.
+    Extended files are processed in order (later files override earlier ones).
+    """
+    # Track loaded files to prevent circular references
+    if _loaded_files is None:
+        _loaded_files = set()
+    
+    # Resolve to absolute path for tracking
+    abs_path = os.path.abspath(yaml_path)
+    if abs_path in _loaded_files:
+        raise ValueError(f"Circular reference detected: {yaml_path}")
+    _loaded_files.add(abs_path)
+    
+    with open(yaml_path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    
+    if not isinstance(data, dict):
+        raise ValueError("YAML file must contain a dictionary of key-value pairs")
+    
+    # Remove 'template' field (handled separately, not a variable)
+    data.pop('template', None)
+    
+    # Handle 'extends' keyword
+    if 'extends' in data:
+        extends = data.pop('extends')  # Remove 'extends' from final data
+        
+        # Normalize to list
+        if isinstance(extends, str):
+            extends = [extends]
+        elif not isinstance(extends, list):
+            raise ValueError("'extends' must be a string or list of strings")
+        
+        # Get directory of current YAML file for relative path resolution
+        base_dir = os.path.dirname(yaml_path) or "."
+        
+        # Start with empty merged data
+        merged_data = {}
+        
+        # Load and merge each extended file in order
+        for extend_file in extends:
+            extend_path = os.path.join(base_dir, extend_file)
+            if not os.path.exists(extend_path):
+                raise FileNotFoundError(f"Extended file not found: {extend_path}")
+            
+            parent_data = load_yaml_data(extend_path, _loaded_files)
+            merged_data.update(parent_data)
+        
+        # Current file's values override extended values
+        merged_data.update(data)
+        data = merged_data
+    
+    return data
+
+
+def replace_placeholders(content: str, variables: dict) -> str:
+    """
+    Replace {{variable-name}} placeholders with values from the dictionary.
+    Handles cases where XML tags might split the placeholder.
+    Variables ending in -url are automatically converted to clickable hyperlinks.
+    """
+    # First, try simple replacement for intact placeholders
+    for key, value in variables.items():
+        placeholder = "{{" + key + "}}"
+        
+        # Check if this is a URL variable - make it a clickable hyperlink
+        if is_url_variable(key):
+            replacement = make_hyperlink(value)
+        else:
+            replacement = escape_xml(value)
+        
+        content = content.replace(placeholder, replacement)
+    
+    # Handle placeholders that might be split by XML formatting tags
+    # Pattern matches {{...}} where content might have XML tags interspersed
+    def replace_split_placeholder(match):
+        # Extract the full match and remove any XML tags to get the key
+        full_match = match.group(0)
+        # Remove XML tags to extract the pure key
+        key = re.sub(r'<[^>]+>', '', full_match)
+        key = key.strip('{}').strip()
+        
+        if key in variables:
+            # Check if this is a URL variable
+            if is_url_variable(key):
+                return make_hyperlink(variables[key])
+            return escape_xml(variables[key])
+        return full_match  # Return original if key not found
+    
+    # Match placeholders that might have XML tags inside them
+    # This pattern looks for {{ followed by content (possibly with tags) followed by }}
+    pattern = r'\{\{(?:<[^>]+>)*([^{}]+?)(?:<[^>]+>)*\}\}'
+    content = re.sub(pattern, replace_split_placeholder, content)
+    
+    return content
+
+
+def process_odt(template_path: str, variables: dict, output_odt_path: str) -> dict:
+    """
+    Extract ODT, replace variables in content.xml, and repackage.
+    
+    Returns a dict with verification info:
+        - template_placeholders: set of placeholders found in template
+        - yaml_variables: set of variable keys from YAML
+        - replaced: set of placeholders that were replaced
+        - unreplaced: set of placeholders that remain in output
+        - unused: set of YAML variables not found in template
+    """
+    verification = {
+        "template_placeholders": set(),
+        "yaml_variables": set(variables.keys()),
+        "replaced": set(),
+        "unreplaced": set(),
+        "unused": set(),
+    }
+    
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Extract the ODT file
+        with zipfile.ZipFile(template_path, 'r') as zip_ref:
+            zip_ref.extractall(temp_dir)
+        
+        # Process content.xml
+        content_xml_path = os.path.join(temp_dir, "content.xml")
+        if not os.path.exists(content_xml_path):
+            raise FileNotFoundError("content.xml not found in ODT file")
+        
+        with open(content_xml_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        
+        # Find placeholders before replacement
+        verification["template_placeholders"] = find_placeholders(content)
+        
+        # Replace placeholders
+        modified_content = replace_placeholders(content, variables)
+        
+        # Find remaining placeholders after replacement
+        remaining_placeholders = find_placeholders(modified_content)
+        
+        with open(content_xml_path, "w", encoding="utf-8") as f:
+            f.write(modified_content)
+        
+        # Also process styles.xml if it exists (some templates have variables there)
+        styles_xml_path = os.path.join(temp_dir, "styles.xml")
+        if os.path.exists(styles_xml_path):
+            with open(styles_xml_path, "r", encoding="utf-8") as f:
+                styles_content = f.read()
+            
+            styles_placeholders = find_placeholders(styles_content)
+            verification["template_placeholders"].update(styles_placeholders)
+            
+            modified_styles = replace_placeholders(styles_content, variables)
+            remaining_placeholders.update(find_placeholders(modified_styles))
+            
+            with open(styles_xml_path, "w", encoding="utf-8") as f:
+                f.write(modified_styles)
+        
+        # Calculate verification results
+        verification["replaced"] = verification["template_placeholders"] - remaining_placeholders
+        verification["unreplaced"] = remaining_placeholders
+        verification["unused"] = verification["yaml_variables"] - verification["template_placeholders"]
+        
+        # Repackage as ODT (ZIP with specific structure)
+        # ODT requires mimetype to be first and uncompressed
+        with zipfile.ZipFile(output_odt_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            # Add mimetype first, uncompressed
+            mimetype_path = os.path.join(temp_dir, "mimetype")
+            if os.path.exists(mimetype_path):
+                zipf.write(mimetype_path, "mimetype", compress_type=zipfile.ZIP_STORED)
+            
+            # Add all other files
+            for root, dirs, files in os.walk(temp_dir):
+                for file in files:
+                    if file == "mimetype":
+                        continue
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, temp_dir)
+                    zipf.write(file_path, arcname)
+    
+    return verification
+
+
+def convert_to_pdf(odt_path: str, output_dir: str) -> str:
+    """Convert ODT to PDF using LibreOffice."""
+    try:
+        result = subprocess.run(
+            [
+                "libreoffice",
+                "--headless",
+                "--convert-to", "pdf",
+                "--outdir", output_dir,
+                odt_path
+            ],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        
+        # Determine the output PDF path
+        odt_basename = os.path.splitext(os.path.basename(odt_path))[0]
+        pdf_path = os.path.join(output_dir, f"{odt_basename}.pdf")
+        
+        if not os.path.exists(pdf_path):
+            raise FileNotFoundError(f"PDF was not created at expected path: {pdf_path}")
+        
+        return pdf_path
+        
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"LibreOffice conversion failed: {e.stderr}")
+    except FileNotFoundError:
+        raise RuntimeError("LibreOffice not found. Please ensure it is installed and in PATH.")
+
+
+def find_matching_pairs(directory: str = ".") -> list:
+    """
+    Find all YAML files that can be processed.
+    
+    Matches:
+    1. {name}.yaml + {name}.odt → {name}.pdf (direct match)
+    2. {name}.yaml with 'template: {other}' + {other}.odt → {name}.pdf
+    
+    Returns list of tuples: (output_name, odt_path, yaml_path)
+    """
+    pairs = []
+    yaml_files = [f for f in os.listdir(directory) if f.endswith('.yaml')]
+    
+    for yaml_file in yaml_files:
+        yaml_path = os.path.join(directory, yaml_file)
+        output_name = os.path.splitext(yaml_file)[0]
+        
+        # Check if YAML has a 'template' field
+        template_name = get_template_from_yaml(yaml_path)
+        
+        if template_name:
+            # Use specified template
+            odt_path = os.path.join(directory, f"{template_name}.odt")
+        else:
+            # Use matching ODT file
+            odt_path = os.path.join(directory, f"{output_name}.odt")
+        
+        if os.path.exists(odt_path):
+            pairs.append((output_name, odt_path, yaml_path))
+    
+    return sorted(pairs)
+
+
+def process_single(base_name: str, odt_path: str, yaml_path: str, 
+                   keep_odt: bool = False, verbose: bool = False) -> bool:
+    """
+    Process a single ODT + YAML pair and generate PDF.
+    Returns True on success, False on failure.
+    """
+    output_dir = os.path.dirname(odt_path) or "."
+    output_pdf = os.path.join(output_dir, f"{base_name}.pdf")
+    
+    try:
+        if verbose:
+            print(f"Loading YAML data from: {yaml_path}")
+        
+        variables = load_yaml_data(yaml_path)
+        
+        if verbose:
+            print(f"Found {len(variables)} variables:")
+            for key in variables:
+                print(f"  - {key}")
+        
+        # Create temporary ODT with substituted values
+        temp_odt_path = os.path.join(output_dir, f"{base_name}_temp.odt")
+        
+        if verbose:
+            print(f"Processing template: {odt_path}")
+        
+        verification = process_odt(odt_path, variables, temp_odt_path)
+        
+        # Print verification results
+        print(f"\n[{base_name}] Replacements:")
+        for key in sorted(verification["replaced"]):
+            suffix = " (hyperlink)" if is_url_variable(key) else ""
+            print(f"  ✓ {{{{{key}}}}}{suffix}")
+        
+        if verification["unreplaced"]:
+            print(f"\n[{base_name}] ⚠ Unreplaced (not in YAML):")
+            for key in sorted(verification["unreplaced"]):
+                print(f"  ✗ {{{{{key}}}}}")
+        
+        if verification["unused"] and verbose:
+            print(f"\n[{base_name}] ℹ Unused YAML variables (not in template):")
+            for key in sorted(verification["unused"]):
+                print(f"  - {key}")
+        
+        if verbose:
+            print(f"\nConverting to PDF...")
+        
+        # Convert to PDF
+        pdf_path = convert_to_pdf(temp_odt_path, output_dir)
+        
+        # Rename if needed
+        if pdf_path != output_pdf:
+            shutil.move(pdf_path, output_pdf)
+        
+        # Clean up temporary ODT unless --keep-odt is specified
+        if keep_odt:
+            final_odt = os.path.join(output_dir, f"{base_name}_output.odt")
+            shutil.move(temp_odt_path, final_odt)
+            if verbose:
+                print(f"Kept ODT file: {final_odt}")
+        else:
+            os.remove(temp_odt_path)
+        
+        print(f"\n✓ Generated: {output_pdf}")
+        return True
+        
+    except Exception as e:
+        print(f"Error processing {base_name}: {e}", file=sys.stderr)
+        # Clean up on error
+        temp_odt_path = os.path.join(output_dir, f"{base_name}_temp.odt")
+        if os.path.exists(temp_odt_path):
+            os.remove(temp_odt_path)
+        return False
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate PDF from ODT template with YAML variable substitution",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    %(prog)s                      # Process all matching .odt + .yaml pairs
+    %(prog)s 10days               # Process 10days.odt + 10days.yaml → 10days.pdf
+    %(prog)s invoice receipt      # Process multiple base names
+
+Files required:
+    For each base name, you need:
+    - {name}.odt   (template file)
+    - {name}.yaml  (variable values)
+    
+    Output will be: {name}.pdf
+
+YAML file format:
+    product-name: My Product
+    buyer-name: John Doe
+    price: $100
+    website-url: https://example.com  # Variables ending in -url become hyperlinks
+        """
+    )
+    
+    parser.add_argument("names", nargs="*", metavar="NAME",
+                        help="Base name(s) to process (without extension)")
+    parser.add_argument("--keep-odt", action="store_true",
+                        help="Keep the intermediate ODT file")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Enable verbose output")
+    
+    args = parser.parse_args()
+    
+    # Check dependencies before processing
+    if not check_dependencies():
+        sys.exit(1)
+    
+    # Determine which files to process
+    if args.names:
+        # Process specified base names
+        pairs = []
+        for name in args.names:
+            # Strip extension if provided
+            base_name = name
+            for ext in ['.odt', '.yaml', '.pdf']:
+                if base_name.endswith(ext):
+                    base_name = base_name[:-len(ext)]
+                    break
+            
+            yaml_path = f"{base_name}.yaml"
+            
+            if not os.path.exists(yaml_path):
+                print(f"Error: YAML file not found: {yaml_path}", file=sys.stderr)
+                sys.exit(1)
+            
+            # Check if YAML specifies a template
+            template_name = get_template_from_yaml(yaml_path)
+            if template_name:
+                odt_path = f"{template_name}.odt"
+            else:
+                odt_path = f"{base_name}.odt"
+            
+            if not os.path.exists(odt_path):
+                print(f"Error: Template not found: {odt_path}", file=sys.stderr)
+                sys.exit(1)
+            
+            pairs.append((base_name, odt_path, yaml_path))
+    else:
+        # Auto-detect all matching pairs in current directory
+        pairs = find_matching_pairs(".")
+        
+        if not pairs:
+            print("No matching .odt + .yaml pairs found in current directory.", file=sys.stderr)
+            print("\nUsage:", file=sys.stderr)
+            print("  Create files with matching names: example.odt + example.yaml", file=sys.stderr)
+            print("  Then run: ./odt2pdf.py", file=sys.stderr)
+            print("\nOr specify a base name: ./odt2pdf.py example", file=sys.stderr)
+            sys.exit(1)
+        
+        print(f"Found {len(pairs)} matching pair(s):")
+        for output_name, odt_path, yaml_path in pairs:
+            odt_name = os.path.basename(odt_path)
+            print(f"  • {odt_name} + {output_name}.yaml → {output_name}.pdf")
+    
+    # Process all pairs
+    success_count = 0
+    fail_count = 0
+    
+    for base_name, odt_path, yaml_path in pairs:
+        if process_single(base_name, odt_path, yaml_path, 
+                         keep_odt=args.keep_odt, verbose=args.verbose):
+            success_count += 1
+        else:
+            fail_count += 1
+    
+    # Summary for multiple files
+    if len(pairs) > 1:
+        print(f"\n{'='*40}")
+        print(f"Summary: {success_count} succeeded, {fail_count} failed")
+    
+    if fail_count > 0:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

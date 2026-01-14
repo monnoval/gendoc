@@ -1,0 +1,23 @@
+# Generated files
+*.pdf
+
+# Template and data files (user-specific)
+*.odt
+*.yaml
+
+# Extracted ODT folders (from unzip)
+temp-*/
+Configurations2/
+META-INF/
+Thumbnails/
+content.xml
+styles.xml
+settings.xml
+meta.xml
+manifest.rdf
+mimetype
+layout-cache
+
+# Keep examples
+!example.odt
+!example.yaml

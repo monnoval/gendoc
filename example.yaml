@@ -1,0 +1,7 @@
+# Example YAML data file
+# Usage: ./gendoc example
+
+title: Welcome Document
+recipient: Alice Johnson
+date: January 14, 2026
+company-url: https://example.com
