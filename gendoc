@@ -323,13 +323,22 @@ def process_odt(template_path: str, variables: dict, output_odt_path: str) -> di
 
 
 def convert_to_pdf(odt_path: str, output_dir: str) -> str:
-    """Convert ODT to PDF using LibreOffice."""
+    """
+    Convert ODT to PDF using LibreOffice.
+    
+    Args:
+        odt_path: Path to the ODT file
+        output_dir: Directory for output PDF
+    """
+    # Use Quality setting for smaller PDFs (90 = good balance of quality and size)
+    convert_to = 'pdf:writer_pdf_Export:{"Quality":{"type":"long","value":"90"}}'
+    
     try:
         result = subprocess.run(
             [
                 "libreoffice",
                 "--headless",
-                "--convert-to", "pdf",
+                "--convert-to", convert_to,
                 "--outdir", output_dir,
                 odt_path
             ],
