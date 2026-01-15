@@ -53,6 +53,22 @@ invoice-feb.yaml         # template: invoice
 → invoice-feb.pdf
 ```
 
+## Configuration
+
+Create `.gendoc.yaml` in your project directory:
+
+```yaml
+output_dir: ~/Documents/output    # Where to save generated PDFs
+exclude:                          # YAML files to skip in auto-discovery
+  - defaults.yaml
+  - example.yaml
+```
+
+| Option | Description |
+|--------|-------------|
+| `output_dir` | Directory for generated PDFs (supports `~`) |
+| `exclude` | List of YAML files to ignore when running `./gendoc` |
+
 ## Template Placeholders
 
 In your ODT file, use `{{variable-name}}` placeholders:

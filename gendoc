@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""
-ODT to PDF Generator with YAML Variable Substitution
-
-Usage:
-    ./odt2pdf.py                  # Process all matching .odt + .yaml pairs
-    ./odt2pdf.py 10days           # Process 10days.odt + 10days.yaml → 10days.pdf
-    ./odt2pdf.py invoice receipt  # Process multiple base names
-"""
 
 import argparse
 import os
@@ -361,7 +353,60 @@ def convert_to_pdf(odt_path: str, output_dir: str) -> str:
         raise RuntimeError("LibreOffice not found. Please ensure it is installed and in PATH.")
 
 
-def find_matching_pairs(directory: str = ".") -> list:
+def load_config(directory: str = ".") -> dict:
+    """
+    Load .gendoc.yaml configuration file if it exists.
+    
+    Supported options:
+        output_dir: directory    # Where to save generated PDFs
+        exclude:                 # YAML files to exclude from auto-discovery
+          - example.yaml
+          - defaults.yaml
+    
+    Returns dict with config values (empty dict if no config file).
+    """
+    config_path = os.path.join(directory, ".gendoc.yaml")
+    config = {
+        "output_dir": None,
+        "exclude": [],
+    }
+    
+    if not os.path.exists(config_path):
+        return config
+    
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        
+        if not isinstance(data, dict):
+            return config
+        
+        if "output_dir" in data:
+            output_dir = data["output_dir"]
+            # Expand ~ to home directory
+            output_dir = os.path.expanduser(output_dir)
+            # Resolve relative paths to config file directory
+            if not os.path.isabs(output_dir):
+                output_dir = os.path.join(directory, output_dir)
+            config["output_dir"] = output_dir
+        
+        if "exclude" in data:
+            exclude = data["exclude"]
+            if isinstance(exclude, str):
+                exclude = [exclude]
+            if isinstance(exclude, list):
+                # Normalize: ensure .yaml extension
+                config["exclude"] = [
+                    f if f.endswith('.yaml') else f + '.yaml'
+                    for f in exclude
+                ]
+    except Exception as e:
+        print(f"Warning: Could not parse .gendoc.yaml: {e}", file=sys.stderr)
+    
+    return config
+
+
+def find_matching_pairs(directory: str = ".", exclude: list = None) -> list:
     """
     Find all YAML files that can be processed.
     
@@ -369,10 +414,20 @@ def find_matching_pairs(directory: str = ".") -> list:
     1. {name}.yaml + {name}.odt → {name}.pdf (direct match)
     2. {name}.yaml with 'template: {other}' + {other}.odt → {name}.pdf
     
+    Args:
+        directory: Directory to search in
+        exclude: List of YAML filenames to skip (e.g. ['defaults.yaml', 'example.yaml'])
+    
     Returns list of tuples: (output_name, odt_path, yaml_path)
     """
+    if exclude is None:
+        exclude = []
+    
+    # Always exclude .gendoc.yaml (it's config, not a document)
+    exclude = set(exclude) | {".gendoc.yaml"}
+    
     pairs = []
-    yaml_files = [f for f in os.listdir(directory) if f.endswith('.yaml')]
+    yaml_files = [f for f in os.listdir(directory) if f.endswith('.yaml') and f not in exclude]
     
     for yaml_file in yaml_files:
         yaml_path = os.path.join(directory, yaml_file)
@@ -395,12 +450,27 @@ def find_matching_pairs(directory: str = ".") -> list:
 
 
 def process_single(base_name: str, odt_path: str, yaml_path: str, 
-                   keep_odt: bool = False, verbose: bool = False) -> bool:
+                   keep_odt: bool = False, verbose: bool = False,
+                   output_dir: str = None) -> bool:
     """
     Process a single ODT + YAML pair and generate PDF.
+    
+    Args:
+        base_name: Output filename (without extension)
+        odt_path: Path to the ODT template
+        yaml_path: Path to the YAML data file
+        keep_odt: Keep intermediate ODT file
+        verbose: Enable verbose output
+        output_dir: Directory for output files (defaults to template directory)
+    
     Returns True on success, False on failure.
     """
-    output_dir = os.path.dirname(odt_path) or "."
+    if output_dir is None:
+        output_dir = os.path.dirname(odt_path) or "."
+    
+    # Ensure output directory exists
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
     output_pdf = os.path.join(output_dir, f"{base_name}.pdf")
     
     try:
@@ -491,6 +561,12 @@ YAML file format:
     buyer-name: John Doe
     price: $100
     website-url: https://example.com  # Variables ending in -url become hyperlinks
+
+Configuration (.gendoc.yaml):
+    output_dir: ./output              # Where to save generated PDFs
+    exclude:                          # YAML files to skip in auto-discovery
+      - defaults.yaml
+      - example.yaml
         """
     )
     
@@ -506,6 +582,19 @@ YAML file format:
     # Check dependencies before processing
     if not check_dependencies():
         sys.exit(1)
+    
+    # Load configuration
+    config = load_config(".")
+    output_dir = config.get("output_dir")
+    exclude_files = config.get("exclude", [])
+    
+    if args.verbose and (output_dir or exclude_files):
+        print("Configuration (.gendoc.yaml):")
+        if output_dir:
+            print(f"  output_dir: {output_dir}")
+        if exclude_files:
+            print(f"  exclude: {exclude_files}")
+        print()
     
     # Determine which files to process
     if args.names:
@@ -539,14 +628,14 @@ YAML file format:
             pairs.append((base_name, odt_path, yaml_path))
     else:
         # Auto-detect all matching pairs in current directory
-        pairs = find_matching_pairs(".")
+        pairs = find_matching_pairs(".", exclude=exclude_files)
         
         if not pairs:
             print("No matching .odt + .yaml pairs found in current directory.", file=sys.stderr)
             print("\nUsage:", file=sys.stderr)
             print("  Create files with matching names: example.odt + example.yaml", file=sys.stderr)
-            print("  Then run: ./odt2pdf.py", file=sys.stderr)
-            print("\nOr specify a base name: ./odt2pdf.py example", file=sys.stderr)
+            print("  Then run: ./gendoc", file=sys.stderr)
+            print("\nOr specify a base name: ./gendoc example", file=sys.stderr)
             sys.exit(1)
         
         print(f"Found {len(pairs)} matching pair(s):")
@@ -560,7 +649,8 @@ YAML file format:
     
     for base_name, odt_path, yaml_path in pairs:
         if process_single(base_name, odt_path, yaml_path, 
-                         keep_odt=args.keep_odt, verbose=args.verbose):
+                         keep_odt=args.keep_odt, verbose=args.verbose,
+                         output_dir=output_dir):
             success_count += 1
         else:
             fail_count += 1
