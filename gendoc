@@ -482,6 +482,10 @@ def process_single(base_name: str, odt_path: str, yaml_path: str,
         os.makedirs(output_dir, exist_ok=True)
     output_pdf = os.path.join(output_dir, f"{base_name}.pdf")
     
+    # Define temp path before try block to ensure cleanup in finally
+    temp_odt_path = os.path.join(tempfile.gettempdir(), f"{base_name}_temp.odt")
+    success = False
+    
     try:
         if verbose:
             print(f"Loading YAML data from: {yaml_path}")
@@ -492,9 +496,6 @@ def process_single(base_name: str, odt_path: str, yaml_path: str,
             print(f"Found {len(variables)} variables:")
             for key in variables:
                 print(f"  - {key}")
-        
-        # Create temporary ODT with substituted values
-        temp_odt_path = os.path.join(output_dir, f"{base_name}_temp.odt")
         
         if verbose:
             print(f"Processing template: {odt_path}")
@@ -527,25 +528,25 @@ def process_single(base_name: str, odt_path: str, yaml_path: str,
         if pdf_path != output_pdf:
             shutil.move(pdf_path, output_pdf)
         
-        # Clean up temporary ODT unless --keep-odt is specified
-        if keep_odt:
-            final_odt = os.path.join(output_dir, f"{base_name}_output.odt")
-            shutil.move(temp_odt_path, final_odt)
-            if verbose:
-                print(f"Kept ODT file: {final_odt}")
-        else:
-            os.remove(temp_odt_path)
-        
         print(f"\n✓ Generated: {output_pdf}")
-        return True
+        success = True
         
     except Exception as e:
         print(f"Error processing {base_name}: {e}", file=sys.stderr)
-        # Clean up on error
-        temp_odt_path = os.path.join(output_dir, f"{base_name}_temp.odt")
+        
+    finally:
+        # Always clean up temp file
         if os.path.exists(temp_odt_path):
-            os.remove(temp_odt_path)
-        return False
+            if keep_odt and success:
+                # Move to output dir if user wants to keep it
+                final_odt = os.path.join(output_dir, f"{base_name}_output.odt")
+                shutil.move(temp_odt_path, final_odt)
+                if verbose:
+                    print(f"Kept ODT file: {final_odt}")
+            else:
+                os.remove(temp_odt_path)
+    
+    return success
 
 
 def main():
