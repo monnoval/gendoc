@@ -38,15 +38,17 @@ def check_dependencies() -> bool:
     return True
 
 
-def escape_xml(value: str) -> str:
+def escape_xml(value) -> str:
     """
-    Escape special XML characters in a string.
-    Also converts newlines to ODT line breaks.
+    Escape special XML characters and convert newlines to ODT line breaks.
+    A list value is treated as multiple lines (each item joined by a line break).
     """
+    if isinstance(value, list):
+        return "<text:line-break/>".join(escape_xml(item) for item in value)
+
     if not isinstance(value, str):
         value = str(value)
-    
-    # First escape XML special characters
+
     value = (
         value
         .replace("&", "&amp;")
@@ -55,24 +57,40 @@ def escape_xml(value: str) -> str:
         .replace('"', "&quot;")
         .replace("'", "&apos;")
     )
-    
-    # Convert newlines to ODT line breaks
     value = value.replace("\n", "<text:line-break/>")
-    
     return value
 
 
-def make_hyperlink(url: str, display_text: str = None) -> str:
+def make_hyperlink(url, display_text: str = None) -> str:
     """
     Create an ODT hyperlink XML element.
     If display_text is None, the URL itself is used as the display text.
+    A list or multiline string is rendered as multiple hyperlinks separated by line breaks.
     """
+    if isinstance(url, list) and display_text is None:
+        urls = [str(u).strip() for u in url if str(u).strip()]
+        return "<text:line-break/>".join(make_hyperlink(u) for u in urls)
+
+    if not isinstance(url, str):
+        url = str(url)
+
+    if "\n" in url and display_text is None:
+        urls = [line.strip() for line in url.split("\n") if line.strip()]
+        return "<text:line-break/>".join(make_hyperlink(u) for u in urls)
+
     if display_text is None:
         display_text = url
-    
-    escaped_url = escape_xml(url)
+
+    # href is an XML attribute — escape characters but never inject tags
+    escaped_url = (
+        url.replace("&", "&amp;")
+           .replace("<", "&lt;")
+           .replace(">", "&gt;")
+           .replace('"', "&quot;")
+           .replace("'", "&apos;")
+    )
     escaped_text = escape_xml(display_text)
-    
+
     return (
         f'<text:a xlink:type="simple" xlink:href="{escaped_url}" '
         f'text:style-name="Internet_20_link" '
@@ -346,20 +364,24 @@ def convert_to_pdf(odt_path: str, output_dir: str) -> str:
             text=True,
             check=True
         )
-        
-        # Determine the output PDF path
-        odt_basename = os.path.splitext(os.path.basename(odt_path))[0]
-        pdf_path = os.path.join(output_dir, f"{odt_basename}.pdf")
-        
-        if not os.path.exists(pdf_path):
-            raise FileNotFoundError(f"PDF was not created at expected path: {pdf_path}")
-        
-        return pdf_path
-        
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"LibreOffice conversion failed: {e.stderr}")
     except FileNotFoundError:
         raise RuntimeError("LibreOffice not found. Please ensure it is installed and in PATH.")
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"LibreOffice conversion failed: {e.stderr}")
+
+    # LibreOffice often exits 0 even when conversion fails (e.g. malformed ODT XML),
+    # so verify the PDF exists and surface stderr if it doesn't.
+    odt_basename = os.path.splitext(os.path.basename(odt_path))[0]
+    pdf_path = os.path.join(output_dir, f"{odt_basename}.pdf")
+
+    if not os.path.exists(pdf_path):
+        stderr_msg = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"LibreOffice did not produce a PDF at {pdf_path}. "
+            f"Output: {stderr_msg or '(none)'}"
+        )
+
+    return pdf_path
 
 
 def load_config(directory: str = ".") -> dict:
